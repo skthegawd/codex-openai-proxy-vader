@@ -165,11 +165,38 @@ struct DeltaFunction {
     arguments: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
+struct PromptTokensDetails {
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
 struct Usage {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    // The upstream Responses payload reports prompt-cache hits under
+    // `input_tokens_details.cached_tokens`. Chat Completions names the same number
+    // `prompt_tokens_details.cached_tokens`. Translating without this field silently
+    // reported every cached call as a full-price miss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Translate an upstream Responses `usage` object into the Chat Completions shape.
+fn usage_from_upstream(u: &Value) -> Usage {
+    let prompt_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+    let completion_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        // Absent upstream (rather than zero) stays absent, so a caller can tell
+        // "no cache information" apart from "measured, and nothing was cached".
+        prompt_tokens_details: u["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1004,15 +1031,7 @@ fn final_stream_chunk(
     finish_reason: &str,
     stream_include_usage: bool,
 ) -> String {
-    let usage_obj = usage.map(|u| {
-        let prompt_tokens = u["input_tokens"].as_u64().unwrap_or(0);
-        let completion_tokens = u["output_tokens"].as_u64().unwrap_or(0);
-        Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-        }
-    });
+    let usage_obj = usage.map(usage_from_upstream);
 
     let finish_chunk = ChatCompletionChunk {
         id: resp_id.to_string(),
@@ -1147,13 +1166,7 @@ async fn handle_non_streaming(upstream: reqwest::Response, resp_id: &str, model:
             "response.completed" => {
                 if let Some(resp) = event.get("response") {
                     if let Some(u) = resp.get("usage") {
-                        let prompt_tokens = u["input_tokens"].as_u64().unwrap_or(0);
-                        let completion_tokens = u["output_tokens"].as_u64().unwrap_or(0);
-                        usage = Some(Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens: prompt_tokens + completion_tokens,
-                        });
+                        usage = Some(usage_from_upstream(u));
                     }
                 }
                 finish_reason = if !tool_calls_resp.is_empty() {
@@ -1195,6 +1208,7 @@ async fn handle_non_streaming(upstream: reqwest::Response, resp_id: &str, model:
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
+            prompt_tokens_details: None,
         }),
     };
 
@@ -1362,5 +1376,54 @@ mod tests {
 
         assert_eq!(body["input"].as_array().unwrap().len(), 2);
         assert_eq!(body["input"][1]["type"], "function_call");
+    }
+
+    #[test]
+    fn usage_translation_carries_prompt_cache_hits() {
+        let upstream = serde_json::json!({
+            "input_tokens": 29741,
+            "input_tokens_details": {"cached_tokens": 29440, "cache_write_tokens": 0},
+            "output_tokens": 15
+        });
+
+        let usage = usage_from_upstream(&upstream);
+
+        assert_eq!(usage.prompt_tokens, 29741);
+        assert_eq!(usage.completion_tokens, 15);
+        assert_eq!(usage.total_tokens, 29756);
+        assert_eq!(
+            usage.prompt_tokens_details,
+            Some(PromptTokensDetails {
+                cached_tokens: 29440
+            })
+        );
+    }
+
+    #[test]
+    fn usage_translation_reports_a_measured_zero_as_zero() {
+        let upstream = serde_json::json!({
+            "input_tokens": 1200,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 4
+        });
+
+        let usage = usage_from_upstream(&upstream);
+
+        assert_eq!(
+            usage.prompt_tokens_details,
+            Some(PromptTokensDetails { cached_tokens: 0 })
+        );
+    }
+
+    #[test]
+    fn usage_translation_omits_details_when_upstream_is_silent() {
+        // No cache information at all must stay absent, not become a fabricated zero.
+        let upstream = serde_json::json!({"input_tokens": 10, "output_tokens": 2});
+
+        let usage = usage_from_upstream(&upstream);
+
+        assert_eq!(usage.prompt_tokens_details, None);
+        let encoded = serde_json::to_value(&usage).expect("serializes");
+        assert!(encoded.get("prompt_tokens_details").is_none());
     }
 }
