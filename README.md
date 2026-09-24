@@ -88,7 +88,7 @@ Translates OpenAI chat completions format to Codex Responses API and back.
 Supports both streaming (`"stream": true`) and non-streaming modes.
 
 ### `POST /v1/images/generations` and `POST /v1/images/edits`
-Translates OpenAI-compatible image generation/edit requests to Codex Responses API image-generation tools. The proxy sends the same backend family used by Codex (`https://chatgpt.com/backend-api/codex/responses`) and converts `image_generation_call` SSE output into OpenAI image response data.
+Translates OpenAI-compatible image generation/edit requests to Codex Responses API image-generation tools. The image tool runs under a main model, `gpt-5.4-mini` by default; set `CODEX_IMAGES_MAIN_MODEL` (for example `gpt-5.6-luna`) when your ChatGPT account does not accept the default, which otherwise makes every image request a 400. The proxy sends the same backend family used by Codex (`https://chatgpt.com/backend-api/codex/responses`) and converts `image_generation_call` SSE output into OpenAI image response data.
 
 #### Reasoning effort
 Append a reasoning suffix to the model name:
