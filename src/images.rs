@@ -14,6 +14,10 @@ use crate::config::AppState;
 use crate::models::{build_auth_headers, copy_codex_passthrough_headers};
 
 const DEFAULT_IMAGES_MAIN_MODEL: &str = "gpt-5.4-mini";
+/// Overrides the main (non-image) model the images endpoints run the image tool under. The
+/// default is not accepted by every ChatGPT account ("The 'gpt-5.4-mini' model is not supported
+/// when using Codex with a ChatGPT account"), which makes every image request a 400.
+pub const IMAGES_MAIN_MODEL_ENV: &str = "CODEX_IMAGES_MAIN_MODEL";
 const DEFAULT_IMAGES_TOOL_MODEL: &str = "gpt-image-2";
 
 // ── Request types ─────────────────────────────────────────────────────────
@@ -149,13 +153,22 @@ fn resolve_image_model(requested: Option<&str>) -> String {
 }
 
 fn resolve_main_model(image_model: &str) -> String {
+    let configured = std::env::var(IMAGES_MAIN_MODEL_ENV).ok();
+    resolve_main_model_with(image_model, configured.as_deref())
+}
+
+fn resolve_main_model_with(image_model: &str, configured: Option<&str>) -> String {
+    let base = configured
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(DEFAULT_IMAGES_MAIN_MODEL);
     if let Some(idx) = image_model.rfind('/') {
         let prefix = image_model[..idx].trim();
         if !prefix.is_empty() {
-            return format!("{}/{}", prefix, DEFAULT_IMAGES_MAIN_MODEL);
+            return format!("{}/{}", prefix, base);
         }
     }
-    DEFAULT_IMAGES_MAIN_MODEL.to_string()
+    base.to_string()
 }
 
 fn resolve_response_format(fmt: Option<&str>) -> String {
@@ -1119,6 +1132,17 @@ mod tests {
         assert_eq!(image.output_format, "png");
         assert_eq!(image.revised_prompt, "tiny icon");
         assert_eq!(image.size, "1024x1024");
+    }
+
+    #[test]
+    fn main_model_defaults_and_can_be_configured() {
+        assert_eq!(resolve_main_model_with("gpt-image-2", None), DEFAULT_IMAGES_MAIN_MODEL);
+        assert_eq!(resolve_main_model_with("gpt-image-2", Some("  ")), DEFAULT_IMAGES_MAIN_MODEL);
+        assert_eq!(resolve_main_model_with("gpt-image-2", Some("gpt-5.6-luna")), "gpt-5.6-luna");
+        assert_eq!(
+            resolve_main_model_with("openai/gpt-image-2", Some("gpt-5.6-luna")),
+            "openai/gpt-5.6-luna"
+        );
     }
 
     #[test]
