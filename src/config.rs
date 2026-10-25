@@ -21,7 +21,7 @@ pub const AUTH_FILE_ENV: &str = "CODEX_AUTH_FILE";
 pub const AUTH_FILES_ENV: &str = "CODEX_AUTH_FILES";
 
 /// Fallback version if dynamic fetch fails.
-pub const FALLBACK_CLIENT_VERSION: &str = "0.125.0";
+pub const FALLBACK_CLIENT_VERSION: &str = "0.164.0";
 
 /// How often to refresh the version from npm in the background.
 const VERSION_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60); // 6 hours
@@ -224,8 +224,8 @@ impl AppState {
 }
 
 /// Fetch the latest Codex CLI version from npm registry.
-/// Falls back to FALLBACK_CLIENT_VERSION on any error.
-pub async fn fetch_latest_codex_version() -> String {
+/// Returns `None` on any error.
+pub async fn fetch_latest_codex_version() -> Option<String> {
     let client = reqwest::Client::new();
     match client
         .get("https://registry.npmjs.org/@openai/codex/latest")
@@ -236,7 +236,7 @@ pub async fn fetch_latest_codex_version() -> String {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
-                    return version.to_string();
+                    return Some(version.to_string());
                 }
             }
         }
@@ -247,12 +247,25 @@ pub async fn fetch_latest_codex_version() -> String {
             warn!("Failed to fetch Codex version from npm: {e}");
         }
     }
-    FALLBACK_CLIENT_VERSION.to_string()
+    None
 }
 
 /// Update the version stored in AppState (called by background task).
 async fn update_version(state: &Arc<AppState>) {
-    let version = fetch_latest_codex_version().await;
+    apply_fetched_version(state, fetch_latest_codex_version().await).await;
+}
+
+/// Store a freshly fetched version. A failed fetch keeps the version already in
+/// use: upstream rejects current models for an old client version, so falling
+/// back to FALLBACK_CLIENT_VERSION mid-run turns one npm blip into an outage.
+async fn apply_fetched_version(state: &AppState, fetched: Option<String>) {
+    let Some(version) = fetched else {
+        warn!(
+            "Keeping Codex client version {} after a failed refresh",
+            state.client_version().await
+        );
+        return;
+    };
     let user_agent = codex_user_agent_for_version(&version);
     {
         let mut cv = state.client_version.write().await;
@@ -287,7 +300,9 @@ pub async fn make_state(port: u16, version_override: Option<String>) -> Arc<AppS
                 info!("Using pinned Codex client version from CODEX_CLIENT_VERSION: {v}");
                 v
             } else {
-                let v = fetch_latest_codex_version().await;
+                let v = fetch_latest_codex_version()
+                    .await
+                    .unwrap_or_else(|| FALLBACK_CLIENT_VERSION.to_string());
                 info!("Using Codex client version: {v}");
                 v
             }
@@ -317,6 +332,28 @@ mod tests {
                 PathBuf::from("/home/tester/relative/backup.json"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_the_version_in_use() {
+        let state = AppState::new(8080, "0.164.0".to_string());
+
+        apply_fetched_version(&state, None).await;
+
+        assert_eq!(state.client_version().await, "0.164.0");
+        assert_eq!(
+            state.codex_user_agent().await,
+            codex_user_agent_for_version("0.164.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_moves_to_the_fetched_version() {
+        let state = AppState::new(8080, "0.164.0".to_string());
+
+        apply_fetched_version(&state, Some("0.165.0".to_string())).await;
+
+        assert_eq!(state.client_version().await, "0.165.0");
     }
 
     #[test]
